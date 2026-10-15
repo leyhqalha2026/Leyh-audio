@@ -1,59 +1,147 @@
+
 name: build-audio
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
   pages: write
   id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
 jobs:
   gen:
     runs-on: ubuntu-latest
     timeout-minutes: 340
+
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install edge-tts
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: restore previous progress
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install edge-tts
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Restore previous progress
         uses: actions/cache/restore@v4
         with:
           path: out
           key: audio-${{ matrix.shard }}-v1
-      - run: python gen_audio.py --shard ${{ matrix.shard }} --of 8 --out out
-      - name: save progress
+          restore-keys: |
+            audio-${{ matrix.shard }}-v1-
+
+      - name: Generate audio
+        run: |
+          python gen_audio.py --shard ${{ matrix.shard }} --of 8 --out out
+
+      - name: Save progress
         if: always()
         uses: actions/cache/save@v4
         with:
           path: out
           key: audio-${{ matrix.shard }}-v1-${{ github.run_id }}
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload audio files
+        uses: actions/upload-artifact@v4
         with:
           name: audio-${{ matrix.shard }}
-          path: out
+          path: out/
+          if-no-files-found: error
           retention-days: 1
+
   deploy:
     needs: gen
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
-      url: ${{ steps.dep.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download generated audio
+        uses: actions/download-artifact@v4
         with:
+          pattern: audio-*
           path: parts
-      - run: |
+          merge-multiple: false
+
+      - name: Build audio website
+        run: |
           mkdir -p _site/a
-          cp parts/*/*.mp3 _site/a/
-          echo ok > _site/a/ok.txt
-          ls _site/a | wc -l
-      - uses: actions/upload-pages-artifact@v3
+
+          find parts -type f -iname '*.mp3' -exec cp -n {} _site/a/ \;
+
+          python - <<'PY'
+          from pathlib import Path
+          from html import escape
+
+          folder = Path("_site/a")
+          files = sorted(folder.glob("*.mp3"))
+
+          items = []
+          for f in files:
+              name = escape(f.name)
+              url = "a/" + escape(f.name, quote=True)
+              items.append(
+                  f'<li><h3>{name}</h3>'
+                  f'<audio controls preload="none" src="{url}"></audio>'
+                  f'<p><a href="{url}" download>تحميل الملف</a> | '
+                  f'<a href="{url}">رابط الملف المباشر</a></p></li>'
+              )
+
+          content = "".join(items) or "<p>لم يتم العثور على ملفات MP3.</p>"
+
+          page = f"""<!doctype html>
+          <html lang="ar" dir="rtl">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>مكتبة الصوت</title>
+          <style>
+          body{{font-family:Arial,sans-serif;max-width:900px;margin:25px auto;padding:16px;line-height:1.7}}
+          li{{padding:16px 0;border-bottom:1px solid #ddd;overflow-wrap:anywhere}}
+          audio{{width:100%}}
+          a{{margin-left:8px}}
+          </style>
+          </head>
+          <body>
+          <h1>مكتبة الصوت</h1>
+          <p>عدد الملفات الصوتية: {len(files)}</p>
+          <ol>{content}</ol>
+          </body>
+          </html>"""
+
+          Path("_site/index.html").write_text(page, encoding="utf-8")
+          Path("_site/a/ok.txt").write_text("ok", encoding="utf-8")
+          print(f"Audio files found: {len(files)}")
+          PY
+
+          test -f _site/index.html
+          test -f _site/a/ok.txt
+          find _site -maxdepth 2 -type f | head -30
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           path: _site
-      - id: dep
+
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
